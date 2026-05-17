@@ -1,6 +1,7 @@
 import streamlit as st
 import sqlite3
 import random
+import itertools
 import pandas as pd
 from datetime import date
 import os
@@ -48,6 +49,7 @@ p, div, span, label { color: #c8d8c8; }
     border: none !important;
     transition: all 0.2s ease !important;
     padding: 0.45rem 1.2rem !important;
+    color: #000 !important;
 }
 .stButton > button[kind="primary"] {
     background: linear-gradient(135deg, #00c853, #00e676) !important;
@@ -60,7 +62,7 @@ p, div, span, label { color: #c8d8c8; }
 }
 .stButton > button[kind="secondary"] {
     background: rgba(255,255,255,0.06) !important;
-    color: #aaa !important;
+    color: #000 !important;
     border: 1px solid rgba(255,255,255,0.12) !important;
 }
 .stButton > button[kind="secondary"]:hover {
@@ -98,7 +100,7 @@ p, div, span, label { color: #c8d8c8; }
     background: rgba(255,255,255,0.05) !important;
     border: 1px solid rgba(0,255,136,0.25) !important;
     border-radius: 6px !important;
-    color: #fff !important;
+    color: #000 !important;
     font-family: 'Rajdhani', sans-serif !important;
     font-size: 1rem !important;
 }
@@ -106,26 +108,54 @@ p, div, span, label { color: #c8d8c8; }
     border-color: rgba(0,255,136,0.6) !important;
     box-shadow: 0 0 0 2px rgba(0,255,136,0.1) !important;
 }
+.stTextInput > div > div > input::placeholder { color: #666 !important; }
 .stSelectbox > div > div {
     background: rgba(255,255,255,0.05) !important;
     border: 1px solid rgba(0,255,136,0.25) !important;
     border-radius: 6px !important;
-    color: #fff !important;
+    color: #000 !important;
 }
-.stSelectbox [data-baseweb="select"] { background: transparent !important; }
+.stSelectbox [data-baseweb="select"] { background: transparent !important; color: #000 !important; }
+.stSelectbox [role="button"],
+.stSelectbox [role="option"],
+.stSelectbox [role="listbox"],
+.stSelectbox [data-baseweb="option-list"],
+.stSelectbox [data-testid="stSelectbox"] *,
+.stSelectbox * {
+    color: #000 !important;
+}
+.stSelectbox [role="option"] {
+    background: rgba(255,255,255,0.95) !important;
+}
 .stSelectbox svg { fill: #00ff88 !important; }
+
+/* ── Dropdown overlay text color fixes ── */
+.stSelectbox input,
+.stSelectbox input::placeholder,
+.stSelectbox [role="combobox"],
+.stSelectbox [role="button"],
+.stSelectbox [role="listbox"],
+.stSelectbox [role="option"],
+li[role="option"],
+li[role="option"] *,
+[role="option"] {
+    color: #000 !important;
+}
 
 /* ── Color Picker ── */
 .stColorPicker > div { background: transparent !important; }
 
 /* ── Expander ── */
-.streamlit-expanderHeader {
-    background: rgba(255,255,255,0.03) !important;
+.streamlit-expanderHeader, .stExpanderHeader, [data-testid="stExpanderHeader"], [data-testid="stExpanderHeader"] * {
+    background: rgba(0,255,136,0.06) !important;
     border: 1px solid rgba(0,255,136,0.15) !important;
     border-radius: 8px !important;
     font-family: 'Bebas Neue', sans-serif !important;
     letter-spacing: 2px !important;
     font-size: 1.05rem !important;
+    color: #00ff88 !important;
+}
+[aria-expanded] {
     color: #00ff88 !important;
 }
 .streamlit-expanderContent {
@@ -398,8 +428,14 @@ with m2:
 with m3:
     st.metric("📅 Today's Matches", int(today_matches_played))
 with m4:
-    leader = all_stats.iloc[0]['player'] if len(all_stats) > 0 else "—"
-    st.metric("👑 All-time Leader", leader)
+    if len(all_stats) > 0:
+        top_points = all_stats.iloc[0]['points']
+        tied = all_stats[all_stats['points'] == top_points]['player'].tolist()
+        leader_names = ", ".join(tied)
+        leader_display = f"{leader_names} — {int(top_points)} pts"
+    else:
+        leader_display = "—"
+    st.metric("👑 All-time Leader", leader_display)
 
 st.markdown("<div style='margin-bottom:1.5rem'></div>", unsafe_allow_html=True)
 
@@ -478,23 +514,61 @@ with tab_game:
         with gc1:
             gen_disabled = n_sel < 4
             if st.button("🎲  GENERATE RANDOM PAIRS", type="primary", disabled=gen_disabled, use_container_width=True):
-                pool = selected.copy()
-                random.shuffle(pool)
+                # Generate matches so every player partners with every other player
+                teams = [list(t) for t in itertools.combinations(selected, 2)]
+                random.shuffle(teams)
                 delete_session_matches(today_session_id)
-                while len(pool) >= 4:
-                    t1p1, t1p2, t2p1, t2p2 = pool.pop(), pool.pop(), pool.pop(), pool.pop()
-                    save_match(today_session_id, t1p1, t1p2, t2p1, t2p2)
-                st.session_state.bench = pool
+                matches = []
+                # Greedily pair disjoint teams into matches
+                while teams:
+                    t1 = teams.pop(0)
+                    found = False
+                    for i, t in enumerate(teams):
+                        if set(t1).isdisjoint(t):
+                            t2 = teams.pop(i)
+                            matches.append((t1[0], t1[1], t2[0], t2[1]))
+                            found = True
+                            break
+                    if not found:
+                        # couldn't find a disjoint team now, append to end and try later
+                        teams.append(t1)
+                        # if we cycled through without making progress, stop
+                        # (prevents infinite loop on small/odd sets)
+                        if all(not set(teams[0]).isdisjoint(t) for t in teams[1:]):
+                            break
+                # Save generated matches
+                used_players = set()
+                for m in matches:
+                    save_match(today_session_id, m[0], m[1], m[2], m[3])
+                    used_players.update([m[0], m[1], m[2], m[3]])
+                # bench any players not used in matches
+                st.session_state.bench = [p for p in selected if p not in used_players]
                 st.rerun()
         with gc2:
             if st.button("🔀  RESHUFFLE", use_container_width=True):
-                pool = selected.copy()
-                random.shuffle(pool)
+                # Reshuffle to generate all partner pairings again
+                teams = [list(t) for t in itertools.combinations(selected, 2)]
+                random.shuffle(teams)
                 delete_session_matches(today_session_id)
-                while len(pool) >= 4:
-                    t1p1, t1p2, t2p1, t2p2 = pool.pop(), pool.pop(), pool.pop(), pool.pop()
-                    save_match(today_session_id, t1p1, t1p2, t2p1, t2p2)
-                st.session_state.bench = pool
+                matches = []
+                while teams:
+                    t1 = teams.pop(0)
+                    found = False
+                    for i, t in enumerate(teams):
+                        if set(t1).isdisjoint(t):
+                            t2 = teams.pop(i)
+                            matches.append((t1[0], t1[1], t2[0], t2[1]))
+                            found = True
+                            break
+                    if not found:
+                        teams.append(t1)
+                        if all(not set(teams[0]).isdisjoint(t) for t in teams[1:]):
+                            break
+                used_players = set()
+                for m in matches:
+                    save_match(today_session_id, m[0], m[1], m[2], m[3])
+                    used_players.update([m[0], m[1], m[2], m[3]])
+                st.session_state.bench = [p for p in selected if p not in used_players]
                 st.rerun()
         with gc3:
             if st.button("🗑️  CLEAR ALL", use_container_width=True):
@@ -521,7 +595,7 @@ with tab_game:
             st.markdown(f"""
             <div style="font-family:'Bebas Neue'; font-size:1.4rem; color:#ccc; 
                         letter-spacing:3px; margin:1rem 0 0.5rem;">
-                ⚡ {len(matches_df)} COURT{'S' if len(matches_df)!=1 else ''} TODAY
+                ⚡ {len(matches_df)} ROUND{'S' if len(matches_df)!=1 else ''} TODAY
             </div>
             """, unsafe_allow_html=True)
 
