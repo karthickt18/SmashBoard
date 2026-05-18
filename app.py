@@ -10,7 +10,7 @@ import os
 # PAGE CONFIG
 # ═══════════════════════════════════════════════════════════════════
 st.set_page_config(
-    page_title="🏸 Smash League",
+    page_title="🏸 ZION SMASH LEAGUE",
     page_icon="🏸",
     layout="wide",
     initial_sidebar_state="collapsed"
@@ -245,9 +245,17 @@ hr { border-color: rgba(0,255,136,0.15) !important; }
 # DATABASE SETUP
 # ═══════════════════════════════════════════════════════════════════
 DB_PATH = "badminton.db"
+ADMIN_PASSWORD = os.getenv("SMASH_ADMIN_PASSWORD", "smashadmin")
 
 def get_conn():
     return sqlite3.connect(DB_PATH, check_same_thread=False)
+
+def safe_rerun():
+    if hasattr(st, "rerun"):
+        return st.rerun()
+    if hasattr(st, "experimental_rerun"):
+        return st.experimental_rerun()
+    return st.stop()
 
 def init_db():
     conn = get_conn()
@@ -342,6 +350,42 @@ def delete_session_matches(session_id):
     conn.commit()
     conn.close()
 
+def delete_match(match_id):
+    conn = get_conn()
+    conn.execute("DELETE FROM matches WHERE id=?", (match_id,))
+    conn.commit()
+    conn.close()
+
+def delete_session(session_id):
+    delete_session_matches(session_id)
+    conn = get_conn()
+    conn.execute("DELETE FROM sessions WHERE id=?", (session_id,))
+    conn.commit()
+    conn.close()
+
+def delete_all_matches():
+    conn = get_conn()
+    conn.execute("DELETE FROM matches")
+    conn.commit()
+    conn.close()
+
+def delete_all_sessions():
+    conn = get_conn()
+    conn.execute("DELETE FROM sessions")
+    conn.commit()
+    conn.close()
+
+def delete_all_players():
+    conn = get_conn()
+    conn.execute("DELETE FROM players")
+    conn.commit()
+    conn.close()
+
+def reset_database():
+    delete_all_matches()
+    delete_all_sessions()
+    delete_all_players()
+
 # ── Stats ────────────────────────────────────────────────────────
 STATS_QUERY = """
 WITH all_p AS (
@@ -403,7 +447,7 @@ st.markdown("""
     <div style="font-family:'Bebas Neue',sans-serif; font-size: 3.8rem; line-height:1;
                 background: linear-gradient(135deg, #00ff88 0%, #00cfff 100%);
                 -webkit-background-clip: text; -webkit-text-fill-color: transparent;
-                letter-spacing: 8px; margin-bottom: 0.2rem;">SMASH LEAGUE</div>
+                letter-spacing: 8px; margin-bottom: 0.2rem;">ZION SMASH LEAGUE</div>
     <div style="font-family:'Share Tech Mono',monospace; font-size: 0.8rem; 
                 color: #445; letter-spacing: 6px; text-transform:uppercase;">
         Badminton Tournament Manager
@@ -442,11 +486,15 @@ st.markdown("<div style='margin-bottom:1.5rem'></div>", unsafe_allow_html=True)
 # ═══════════════════════════════════════════════════════════════════
 # TABS
 # ═══════════════════════════════════════════════════════════════════
-tab_game, tab_boards, tab_players, tab_history = st.tabs([
+if "admin_authenticated" not in st.session_state:
+    st.session_state.admin_authenticated = False
+
+tab_game, tab_boards, tab_players, tab_history, tab_admin = st.tabs([
     "🎮  TODAY'S GAME",
     "🏆  LEADERBOARDS",
     "👥  PLAYERS",
-    "📋  HISTORY"
+    "📋  HISTORY",
+    "🔒  ADMIN"
 ])
 
 # ══════════════════════════════════════════════════════════
@@ -605,7 +653,7 @@ with tab_game:
                 t1w = winner == 1
                 t2w = winner == 2
 
-                c1, c2, c3, c_score, c_win = st.columns([3, 0.7, 3, 2, 3])
+                c1, c2, c3, c_score, c_win, c_del = st.columns([3, 0.7, 3, 2, 3, 1.2])
 
                 with c1:
                     bc1 = color_map.get(match["team1_p1"], "#00e676")
@@ -664,6 +712,15 @@ with tab_game:
                     new_winner = opts.index(chosen)
                     if new_winner != winner or new_score != (match["score"] or ""):
                         update_match(mid, new_winner, new_score)
+                        st.rerun()
+
+                with c_del:
+                    if st.button("Delete", key=f"delete_match_{mid}", use_container_width=True):
+                        delete_match(mid)
+                        remaining = get_session_matches(today_session_id)
+                        used_players = set(remaining["team1_p1"].tolist() + remaining["team1_p2"].tolist() + remaining["team2_p1"].tolist() + remaining["team2_p2"].tolist())
+                        st.session_state.bench = [p for p in selected if p not in used_players]
+                        st.success("Match deleted.")
                         st.rerun()
 
                 st.markdown("<div style='border-bottom:1px solid rgba(255,255,255,0.05); margin:0.5rem 0'></div>", unsafe_allow_html=True)
@@ -885,7 +942,14 @@ with tab_history:
                         else:
                             line = f"⏳ {t1} vs {t2} — *no result*"
 
-                        st.markdown(line)
+                        row_cols = st.columns([10, 1])
+                        with row_cols[0]:
+                            st.markdown(line)
+                        with row_cols[1]:
+                            if st.button("Delete", key=f"history_delete_match_{int(m['id'])}", use_container_width=True):
+                                delete_match(int(m['id']))
+                                st.success("Match deleted.")
+                                st.rerun()
 
                     # Daily stats for this session
                     ds = get_daily_stats(sid)
@@ -899,11 +963,67 @@ with tab_history:
                                     f"{int(row['points'])} pts",
                                     f"{int(row['wins'])}W {int(row['losses'])}L"
                                 )
+                    if st.button("Delete session", key=f"delete_session_{sid}", use_container_width=True):
+                        delete_session(sid)
+                        st.success("Session deleted.")
+                        st.rerun()
+with tab_admin:
+    st.markdown("""
+    <div style="font-family:'Bebas Neue'; font-size:1.8rem; letter-spacing:3px;
+                color:#ff6b6b; margin-bottom:1rem;">🔒 ADMIN PANEL</div>
+    """, unsafe_allow_html=True)
 
+    if not st.session_state.admin_authenticated:
+        st.warning("This section is password protected. Only authorized users should proceed.")
+        password = st.text_input("Admin password", type="password", key="admin_password")
+        if st.button("Unlock Admin Panel", type="primary", use_container_width=True, key="admin_unlock"):
+            if password == ADMIN_PASSWORD:
+                st.session_state.admin_authenticated = True
+                st.success("Admin access granted.")
+                safe_rerun()
+            else:
+                st.error("Invalid password. Please try again.")
+    else:
+        st.success("Admin access granted.")
+        admin_info1, admin_info2, admin_info3 = st.columns(3)
+        with admin_info1:
+            st.metric("Players", len(get_players()))
+        with admin_info2:
+            st.metric("Sessions", len(get_all_sessions()))
+        with admin_info3:
+            conn = get_conn()
+            match_count = pd.read_sql("SELECT COUNT(*) as n FROM matches", conn).iloc[0]["n"]
+            conn.close()
+            st.metric("Matches", int(match_count))
+
+        st.markdown("---")
+        if st.button("Delete all matches", key="admin_delete_matches", use_container_width=True):
+            delete_all_matches()
+            st.success("All matches have been removed.")
+            safe_rerun()
+
+        if st.button("Delete all sessions", key="admin_delete_sessions", use_container_width=True):
+            delete_all_sessions()
+            st.success("All session records have been removed.")
+            safe_rerun()
+
+        if st.button("Delete all players", key="admin_delete_players", use_container_width=True):
+            delete_all_players()
+            st.success("All players have been removed.")
+            safe_rerun()
+
+        if st.button("Factory reset database", key="admin_reset_db", use_container_width=True):
+            reset_database()
+            st.success("Database has been reset.")
+            safe_rerun()
+
+        if st.button("Logout", key="admin_logout", type="secondary", use_container_width=True):
+            st.session_state.admin_authenticated = False
+            safe_rerun()
 # ── Footer ──
 st.markdown("""
 <div style="text-align:center; padding:2rem 0 1rem; 
             font-family:'Share Tech Mono'; font-size:0.75rem; color:#223;">
-    SMASH LEAGUE · Built with Streamlit · 🏸
+    ZION SMASH LEAGUE · Built with Streamlit · 🏸
 </div>
 """, unsafe_allow_html=True)
