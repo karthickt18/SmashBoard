@@ -1,10 +1,14 @@
 import streamlit as st
 import sqlite3
 import random
+import math
 import itertools
 import pandas as pd
 from datetime import date
 import os
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+DB_PATH = os.path.join(HERE, "badminton.db")
 
 # ═══════════════════════════════════════════════════════════════════
 # PAGE CONFIG
@@ -244,7 +248,6 @@ hr { border-color: rgba(0,255,136,0.15) !important; }
 # ═══════════════════════════════════════════════════════════════════
 # DATABASE SETUP
 # ═══════════════════════════════════════════════════════════════════
-DB_PATH = "badminton.db"
 ADMIN_PASSWORD = os.getenv("SMASH_ADMIN_PASSWORD", "smashadmin")
 
 def get_conn():
@@ -276,8 +279,13 @@ def init_db():
         team2_p1 TEXT, team2_p2 TEXT,
         winner INTEGER DEFAULT 0,
         score TEXT DEFAULT "",
+        round_number INTEGER DEFAULT 1,
         FOREIGN KEY(session_id) REFERENCES sessions(id)
     )''')
+    conn.commit()
+    c.execute("PRAGMA table_info(matches)")
+    if not any(row[1] == "round_number" for row in c.fetchall()):
+        c.execute("ALTER TABLE matches ADD COLUMN round_number INTEGER DEFAULT 1")
     conn.commit()
     conn.close()
 
@@ -325,15 +333,15 @@ def get_all_sessions():
 # ── Matches ──────────────────────────────────────────────────────
 def get_session_matches(session_id):
     conn = get_conn()
-    df = pd.read_sql(f"SELECT * FROM matches WHERE session_id={session_id} ORDER BY id", conn)
+    df = pd.read_sql(f"SELECT * FROM matches WHERE session_id={session_id} ORDER BY round_number, id", conn)
     conn.close()
     return df
 
-def save_match(session_id, t1p1, t1p2, t2p1, t2p2):
+def save_match(session_id, t1p1, t1p2, t2p1, t2p2, round_number=1):
     conn = get_conn()
     conn.execute(
-        "INSERT INTO matches (session_id, team1_p1, team1_p2, team2_p1, team2_p2) VALUES (?,?,?,?,?)",
-        (session_id, t1p1, t1p2, t2p1, t2p2)
+        "INSERT INTO matches (session_id, team1_p1, team1_p2, team2_p1, team2_p2, round_number) VALUES (?,?,?,?,?,?)",
+        (session_id, t1p1, t1p2, t2p1, t2p2, round_number)
     )
     conn.commit()
     conn.close()
@@ -385,6 +393,43 @@ def reset_database():
     delete_all_matches()
     delete_all_sessions()
     delete_all_players()
+
+def build_match_schedule(selected):
+    # Round-robin scheduling with balanced rest.
+    # For n divisible by 4, every player plays each round.
+    # For other sizes, the bench rotates so rest is distributed evenly.
+    players = list(selected)
+    n = len(players)
+    if n < 4:
+        return []
+
+    random.shuffle(players)
+    if n % 4 == 0:
+        round_count = n - 1
+        bench_size = 0
+    else:
+        bench_size = n % 4
+        round_count = math.ceil(n / bench_size)
+
+    schedule = []
+    for r in range(round_count):
+        bench = []
+        if bench_size > 0:
+            bench = [players[(r * bench_size + i) % n] for i in range(bench_size)]
+        active = [p for p in players if p not in bench]
+        random.shuffle(active)
+
+        matches = []
+        for i in range(0, len(active), 4):
+            group = active[i:i+4]
+            if len(group) < 4:
+                break
+            random.shuffle(group)
+            matches.append((group[0], group[1], group[2], group[3]))
+
+        schedule.append({"round": r + 1, "matches": matches, "bench": bench})
+
+    return schedule
 
 # ── Stats ────────────────────────────────────────────────────────
 STATS_QUERY = """
@@ -546,6 +591,7 @@ with tab_game:
         st.markdown("<br>", unsafe_allow_html=True)
         n_matches = n_sel // 4
         n_bench = n_sel % 4
+        n_rounds = 1 if n_sel < 4 or n_bench == 0 else math.ceil(n_sel / n_bench)
         info_html = f"""
         <div style="background:rgba(0,255,136,0.07); border:1px solid rgba(0,255,136,0.2);
                     border-radius:8px; padding:0.7rem 1rem; margin-bottom:1rem;
@@ -553,6 +599,7 @@ with tab_game:
             <b style="color:#00ff88">{n_sel}</b> players selected →
             <b style="color:#00cfff">{n_matches}</b> doubles match{'es' if n_matches!=1 else ''} possible
             {'• <b style="color:#ffd700">' + str(n_bench) + '</b> on bench' if n_bench else ''}
+            {f'• up to <b style="color:#ffd700">{n_rounds}</b> games' if n_bench else ''}
         </div>
         """
         st.markdown(info_html, unsafe_allow_html=True)
@@ -562,61 +609,27 @@ with tab_game:
         with gc1:
             gen_disabled = n_sel < 4
             if st.button("🎲  GENERATE RANDOM PAIRS", type="primary", disabled=gen_disabled, use_container_width=True):
-                # Generate matches so every player partners with every other player
-                teams = [list(t) for t in itertools.combinations(selected, 2)]
-                random.shuffle(teams)
+                schedule = build_match_schedule(selected)
                 delete_session_matches(today_session_id)
-                matches = []
-                # Greedily pair disjoint teams into matches
-                while teams:
-                    t1 = teams.pop(0)
-                    found = False
-                    for i, t in enumerate(teams):
-                        if set(t1).isdisjoint(t):
-                            t2 = teams.pop(i)
-                            matches.append((t1[0], t1[1], t2[0], t2[1]))
-                            found = True
-                            break
-                    if not found:
-                        # couldn't find a disjoint team now, append to end and try later
-                        teams.append(t1)
-                        # if we cycled through without making progress, stop
-                        # (prevents infinite loop on small/odd sets)
-                        if all(not set(teams[0]).isdisjoint(t) for t in teams[1:]):
-                            break
-                # Save generated matches
-                used_players = set()
-                for m in matches:
-                    save_match(today_session_id, m[0], m[1], m[2], m[3])
-                    used_players.update([m[0], m[1], m[2], m[3]])
-                # bench any players not used in matches
-                st.session_state.bench = [p for p in selected if p not in used_players]
+                game_counter = 1
+                for round_info in schedule:
+                    for m in round_info["matches"]:
+                        save_match(today_session_id, m[0], m[1], m[2], m[3], round_number=game_counter)
+                        game_counter += 1
+                st.session_state.bench = schedule[-1]["bench"] if schedule else []
+                st.session_state.schedule = schedule
                 st.rerun()
         with gc2:
             if st.button("🔀  RESHUFFLE", use_container_width=True):
-                # Reshuffle to generate all partner pairings again
-                teams = [list(t) for t in itertools.combinations(selected, 2)]
-                random.shuffle(teams)
+                schedule = build_match_schedule(selected)
                 delete_session_matches(today_session_id)
-                matches = []
-                while teams:
-                    t1 = teams.pop(0)
-                    found = False
-                    for i, t in enumerate(teams):
-                        if set(t1).isdisjoint(t):
-                            t2 = teams.pop(i)
-                            matches.append((t1[0], t1[1], t2[0], t2[1]))
-                            found = True
-                            break
-                    if not found:
-                        teams.append(t1)
-                        if all(not set(teams[0]).isdisjoint(t) for t in teams[1:]):
-                            break
-                used_players = set()
-                for m in matches:
-                    save_match(today_session_id, m[0], m[1], m[2], m[3])
-                    used_players.update([m[0], m[1], m[2], m[3]])
-                st.session_state.bench = [p for p in selected if p not in used_players]
+                game_counter = 1
+                for round_info in schedule:
+                    for m in round_info["matches"]:
+                        save_match(today_session_id, m[0], m[1], m[2], m[3], round_number=game_counter)
+                        game_counter += 1
+                st.session_state.bench = schedule[-1]["bench"] if schedule else []
+                st.session_state.schedule = schedule
                 st.rerun()
         with gc3:
             if st.button("🗑️  CLEAR ALL", use_container_width=True):
@@ -643,11 +656,20 @@ with tab_game:
             st.markdown(f"""
             <div style="font-family:'Bebas Neue'; font-size:1.4rem; color:#ccc; 
                         letter-spacing:3px; margin:1rem 0 0.5rem;">
-                ⚡ {len(matches_df)} ROUND{'S' if len(matches_df)!=1 else ''} TODAY
+                ⚡ {len(matches_df)} GAME{'S' if len(matches_df)!=1 else ''} TODAY
             </div>
             """, unsafe_allow_html=True)
 
+            current_round = None
             for idx, match in matches_df.iterrows():
+                round_number = int(match["round_number"]) if "round_number" in match and not pd.isna(match["round_number"]) else 1
+                if round_number != current_round:
+                    current_round = round_number
+                    st.markdown(f"""
+                    <div style='font-family:"Bebas Neue"; font-size:1.2rem; color:#00cfff; margin:1rem 0 0.25rem;'>
+                        GAME {current_round}
+                    </div>
+                    """, unsafe_allow_html=True)
                 mid = int(match["id"])
                 winner = int(match["winner"]) if match["winner"] else 0
                 t1w = winner == 1
